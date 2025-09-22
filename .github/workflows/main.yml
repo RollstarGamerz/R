@@ -11,69 +11,48 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Ensure Remote Desktop is enabled and required services are automatic
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          # Disable Network Level Authentication (if you asked for that)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          # Enable Remote Desktop and disable NLA
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # Make sure TermService starts automatically
           Set-Service -Name TermService -StartupType Automatic
 
-          # Remove any existing rule with the same name to avoid duplication
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing firewall rule to delete"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Allow RDP on local port 3389 (careful: this exposes RDP if NIC is public)
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-          # Log this action
           $logDir = "C:\RDP_Data"
           if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-          "$((Get-Date).ToString('u')) - Configured core RDP settings" | Out-File -FilePath "$logDir\activity.log" -Append
+          (Get-Date).ToString('u') + " - Configured core RDP settings" | Out-File -FilePath "$logDir\activity.log" -Append
 
       - name: Create RDP User with fixed password
         run: |
-          # WARNING: You asked for fixed password "rollstar". This is insecure to hardcode.
-          # Recommended: use secrets and New-LocalUser -Password (ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force)
           $username = "RDP"
           $plainPassword = "rollstar"
-
-          # Create secure string and user (account never expires)
           $securePass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
 
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-              Write-Host "User $username already exists - ensuring groups and password are set"
-              # Try to set password (requires privileges)
+              Write-Host "User $username already exists, updating password"
               try {
-                  $user = Get-LocalUser -Name $username
-                  $user | Set-LocalUser -Password $securePass
+                  Get-LocalUser -Name $username | Set-LocalUser -Password $securePass
               } catch {
-                  Write-Warning "Could not update password for existing user. Manual update may be required."
+                  Write-Warning "Could not update password for existing user."
               }
           } else {
               New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
           }
 
-          # Ensure groups
           Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
 
-          # Save credentials to persistent file (C:\RDP_Data\creds.txt) — encrypted only by ACL
           $logDir = "C:\RDP_Data"
           if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-          $credFile = "$logDir\creds.txt"
-          "Username: $username" | Out-File -FilePath $credFile -Encoding utf8
-          "Password: $plainPassword" | Out-File -FilePath $credFile -Append -Encoding utf8
-          "$((Get-Date).ToString('u')) - Created/updated user $username" | Out-File -FilePath "$logDir\activity.log" -Append
+          "Username: $username" | Out-File -FilePath "$logDir\creds.txt" -Encoding utf8
+          "Password: $plainPassword" | Out-File -FilePath "$logDir\creds.txt" -Append -Encoding utf8
+          (Get-Date).ToString('u') + " - Created/updated user $username" | Out-File -FilePath "$logDir\activity.log" -Append
 
-          # Expose for later steps in this workflow (env only for this job)
           echo "RDP_CREDS=User: $username | Password: $plainPassword" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
@@ -85,136 +64,96 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-          # Ensure Tailscale service is set to automatic so it persists on reboot
           Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
 
-          # Log install
           $logDir = "C:\RDP_Data"
           if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-          "$((Get-Date).ToString('u')) - Tailscale installed" | Out-File -FilePath "$logDir\activity.log" -Append
+          (Get-Date).ToString('u') + " - Tailscale installed" | Out-File -FilePath "$logDir\activity.log" -Append
 
       - name: Establish Tailscale Connection and capture real IP
         run: |
-          # Bring up Tailscale with the provided auth key (if provided) and hostname
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
           if ($env:TAILSCALE_AUTH_KEY) {
               & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=$hostname
           } else {
-              # If no auth key in environment, attempt to bring service up (machine should already have keys)
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=$hostname || Write-Warning "Tailscale up failed (no auth key)."
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=$hostname || Write-Warning "No auth key available."
           }
 
-          # Get Tailscale IPv4 (if assigned)
           $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
           if ($tsIP) {
               $tsIP = $tsIP.Trim()
               echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          } else {
-              Write-Host "No Tailscale IPv4 assigned (yet)."
           }
 
-          # Determine machine's primary (real) IPv4 address (not loopback, not APIPA 169.*)
           $realIP = (Get-NetIPAddress -AddressFamily IPv4 |
-                     Where-Object {
-                       $_.IPAddress -ne '127.0.0.1' -and
-                       $_.IPAddress -notlike '169.*' -and
-                       $_.PrefixOrigin -ne 'WellKnown' -and
-                       $_.InterfaceOperationalStatus -eq 'Up'
-                     } | Select-Object -First 1).IPAddress
+            Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -notlike '169.*' -and $_.InterfaceOperationalStatus -eq 'Up' } |
+            Select-Object -First 1).IPAddress
 
-          if (-not $realIP) {
-              # fallback to any non-loopback IPv4
-              $realIP = (Get-NetIPAddress -AddressFamily IPv4 |
-                          Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object -First 1).IPAddress
-          }
+          if ($realIP) { echo "REAL_RDP_IP=$realIP" >> $env:GITHUB_ENV }
 
-          if ($realIP) { echo "REAL_RDP_IP=$realIP" >> $env:GITHUB_ENV } else { Write-Warning "Could not determine real IPv4 address." }
-
-          # Persist the chosen addresses to disk
-          $logDir = "C:\RDP_Data"; if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-          "TailscaleIP: $($env:TAILSCALE_IP)" | Out-File -FilePath "$logDir\ips.txt" -Append -Encoding utf8
+          $logDir = "C:\RDP_Data"
+          "TailscaleIP: $tsIP" | Out-File -FilePath "$logDir\ips.txt" -Append -Encoding utf8
           "RealIP: $realIP" | Out-File -FilePath "$logDir\ips.txt" -Append -Encoding utf8
-          "$((Get-Date).ToString('u')) - Captured IPs: Tailscale=$($env:TAILSCALE_IP) Real=$realIP" | Out-File -FilePath "$logDir\activity.log" -Append
+          (Get-Date).ToString('u') + " - Captured IPs" | Out-File -FilePath "$logDir\activity.log" -Append
 
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Real IP: $env:REAL_RDP_IP"
 
-          # Try to test connectivity to Tailscale IP (preferred) and real IP as fallback
           $target = if ($env:TAILSCALE_IP) { $env:TAILSCALE_IP } elseif ($env:REAL_RDP_IP) { $env:REAL_RDP_IP } else { $null }
-
-          if (-not $target) {
-              Write-Error "No target IP available for RDP connectivity test"
-              exit 1
-          }
+          if (-not $target) { Write-Error "No IP available for RDP test"; exit 1 }
 
           $testResult = Test-NetConnection -ComputerName $target -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 on $target failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity to $target:3389 successful!"
-          "$((Get-Date).ToString('u')) - Verified RDP connectivity to $target" | Out-File -FilePath "C:\RDP_Data\activity.log" -Append
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "RDP test failed"; exit 1 }
 
-      - name: Setup Persistence Helpers (logs, startup tasks)
+          Write-Host "TCP connectivity to $target:3389 successful!"
+          (Get-Date).ToString('u') + " - Verified RDP connectivity" | Out-File -FilePath "C:\RDP_Data\activity.log" -Append
+
+      - name: Setup Persistence Helpers
         run: |
           $logDir = "C:\RDP_Data"
           if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
 
           $startupScript = "$logDir\startup-ensure.ps1"
-          $scriptContent = @"
-# This script ensures firewall rule, RDP service, and Tailscale are up on boot.
+          $scriptContent = @'
 try {
-    # Ensure RDP service running
     Set-Service -Name TermService -StartupType Automatic
     Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-    # Ensure firewall rule exists
-    netsh advfirewall firewall delete rule name="RDP-Tailscale" || \$null
-    netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+    netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+    netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
 
-    # Try to bring tailscale up (if binary present)
     if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=$(hostname) 2>$null || \$null
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=$(hostname) 2>$null | Out-Null
     }
 
-    # Log startup execution
-    "$((Get-Date).ToString('u')) - startup-ensure executed" | Out-File -FilePath "$logDir\activity.log" -Append
+    (Get-Date).ToString('u') + " - startup-ensure executed" | Out-File -FilePath "C:\RDP_Data\activity.log" -Append
 } catch {
-    "$((Get-Date).ToString('u')) - startup-ensure failed: $_" | Out-File -FilePath "$logDir\activity.log" -Append
+    (Get-Date).ToString('u') + " - startup-ensure failed: $_" | Out-File -FilePath "C:\RDP_Data\activity.log" -Append
 }
-"@
+'@
 
-          # Save script
           $scriptContent | Out-File -FilePath $startupScript -Encoding utf8 -Force
 
-          # Register a scheduled task to run this script at system startup
           $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$startupScript`""
           $trigger = New-ScheduledTaskTrigger -AtStartup
           $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
           Register-ScheduledTask -TaskName "RDP_EnsureStartup" -Action $action -Trigger $trigger -Principal $principal -Force
 
-          "$((Get-Date).ToString('u')) - Registered scheduled task RDP_EnsureStartup" | Out-File -FilePath "$logDir\activity.log" -Append
+          (Get-Date).ToString('u') + " - Registered scheduled task" | Out-File -FilePath "$logDir\activity.log" -Append
 
-      - name: Maintain Connection (display details + log)
+      - name: Maintain Connection
         run: |
           $logDir = "C:\RDP_Data"
-          if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
-
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address (Tailscale): $env:TAILSCALE_IP"
-          Write-Host "Address (Real): $env:REAL_RDP_IP"
+          Write-Host "Tailscale: $env:TAILSCALE_IP"
+          Write-Host "Real IP: $env:REAL_RDP_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Password: rollstar"
           Write-Host "==================`n"
 
-          # Persist last shown access details
-          "$((Get-Date).ToString('u')) - Displayed RDP access info. Tailscale=$($env:TAILSCALE_IP) Real=$($env:REAL_RDP_IP)" | Out-File -FilePath "$logDir\activity.log" -Append
-
-          # WARNING: GitHub-hosted runners are ephemeral. This loop will keep the job active until timeout,
-          # but after the job completes the VM is destroyed and data will be lost.
           while ($true) {
-              "$((Get-Date).ToString('u')) - RDP Active - workflow running" | Out-File -FilePath "$logDir\activity.log" -Append
+              (Get-Date).ToString('u') + " - RDP Active" | Out-File -FilePath "$logDir\activity.log" -Append
               Start-Sleep -Seconds 300
           }
